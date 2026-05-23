@@ -117,6 +117,69 @@ pip install requests
 
 ---
 
+## Tushare 可选替代源
+
+当前环境若 Yahoo 触发 429、或需要稳定的美股/港股日线和财报数据，可使用 Tushare Pro 作为替代源。Tushare 需要配置环境变量：
+
+```bash
+export TUSHARE_TOKEN="你的token"
+```
+
+以下 helper 直连 Tushare Pro HTTP API，不额外依赖 `tushare` 包，仍然只需要 `requests`。
+
+```python
+import os
+
+TUSHARE_URL = "http://api.tushare.pro"
+
+def get_tushare_token() -> str:
+    """读取 Tushare token。不要把 token 写入代码或提交仓库。"""
+    token = os.getenv("TUSHARE_TOKEN")
+    if not token:
+        raise RuntimeError("缺少 TUSHARE_TOKEN 环境变量")
+    return token
+
+def tushare_pro(api_name: str, params: dict = None, fields: str = "") -> dict:
+    """Tushare Pro 通用查询。返回原始 JSON；code != 0 时抛错。"""
+    payload = {
+        "api_name": api_name,
+        "token": get_tushare_token(),
+        "params": params or {},
+        "fields": fields,
+    }
+    r = requests.post(TUSHARE_URL, json=payload, timeout=20)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != 0:
+        raise RuntimeError(f"Tushare {api_name} failed: {d.get('msg')}")
+    return d
+
+def _tushare_rows(api_name: str, params: dict = None, fields: str = "") -> list[dict]:
+    """把 Tushare fields/items 转成 list[dict]。"""
+    d = tushare_pro(api_name, params=params, fields=fields)
+    data = d.get("data") or {}
+    cols = data.get("fields") or []
+    items = data.get("items") or []
+    return [dict(zip(cols, row)) for row in items]
+
+def _tushare_symbol(symbol: str, market: str = None) -> tuple[str, str]:
+    """
+    规范化 Tushare 代码。
+    美股: AAPL / TSLA
+    港股: 00700.HK / 0700.HK -> 00700.HK
+    返回: (market, ts_code)，market 为 us/hk
+    """
+    s = symbol.upper().strip()
+    if market:
+        market = market.lower()
+    if market == "hk" or s.endswith(".HK") or s.isdigit():
+        code = s.replace(".HK", "").zfill(5)
+        return "hk", f"{code}.HK"
+    return "us", s.replace(".O", "").replace(".N", "")
+```
+
+---
+
 ## 共用 Helper 函数
 
 ### Yahoo Finance crumb 管理器
@@ -253,19 +316,19 @@ def us_stock_quote_tencent(ticker: str) -> dict:
     
     return {
         "name": fields[1],           # 中文名
-        "name_en": fields[27],       # 英文名
+        "name_en": fields[46],       # 英文名
         "price": float(fields[3]) if fields[3] else 0,
         "prev_close": float(fields[4]) if fields[4] else 0,
         "open": float(fields[5]) if fields[5] else 0,
-        "volume": int(fields[6]) if fields[6] else 0,
+        "volume": int(float(fields[36])) if fields[36] else 0,
         "high": float(fields[33]) if fields[33] else 0,
         "low": float(fields[34]) if fields[34] else 0,
-        "high_52w": float(fields[35]) if fields[35] else 0,
-        "low_52w": float(fields[36]) if fields[36] else 0,
+        "high_52w": float(fields[48]) if fields[48] else 0,
+        "low_52w": float(fields[49]) if fields[49] else 0,
         "change_pct": float(fields[32]) if fields[32] else 0,
         "market_cap": float(fields[44]) if fields[44] else 0,  # 亿美元
         "pe": float(fields[53]) if fields[53] else 0,
-        "pb": float(fields[56]) if fields[56] else 0,
+        "pb": float(fields[55]) if fields[55] else 0,
         "timestamp": fields[30],
     }
 ```
@@ -293,19 +356,19 @@ def hk_stock_quote_tencent(code: str) -> dict:
     
     return {
         "name": fields[1],           # 中文名
-        "name_en": fields[2],        # 英文名
+        "name_en": fields[46],       # 英文名
         "price": float(fields[3]) if fields[3] else 0,
         "prev_close": float(fields[4]) if fields[4] else 0,
         "open": float(fields[5]) if fields[5] else 0,
         "high": float(fields[33]) if fields[33] else 0,
         "low": float(fields[34]) if fields[34] else 0,
-        "volume": int(fields[6]) if fields[6] else 0,    # 成交量(股)
+        "volume": int(float(fields[36])) if fields[36] else 0,    # 成交量(股)
         "amount": float(fields[37]) if fields[37] else 0,  # 成交额
         "change_pct": float(fields[32]) if fields[32] else 0,
         "pe": float(fields[39]) if fields[39] else 0,
-        "pb": float(fields[56]) if fields[56] else 0,
-        "high_52w": float(fields[35]) if fields[35] else 0,
-        "low_52w": float(fields[36]) if fields[36] else 0,
+        "pb": float(fields[57]) if fields[57] else 0,
+        "high_52w": float(fields[48]) if fields[48] else 0,
+        "low_52w": float(fields[49]) if fields[49] else 0,
         "market_cap": float(fields[44]) if fields[44] else 0,  # 亿港元
         "timestamp": fields[30],
     }
@@ -363,12 +426,15 @@ def stock_quote_eastmoney(ticker_or_code: str, secid_prefix: int = 105) -> dict:
     secid_prefix 说明: 105=NASDAQ, 106=NYSE, 107=US_ETF, 116=港股
     如不确定前缀，先调 stock_search() 获取 mkt_num
     """
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    url = "https://push2delay.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": f"{secid_prefix}.{ticker_or_code}",
         "fields": "f43,f44,f45,f46,f47,f48,f55,f57,f58,f59,f60,f170",
     }
-    r = requests.get(url, timeout=10)
+    r = requests.get(url, params=params, headers={
+        "User-Agent": UA,
+        "Referer": "https://quote.eastmoney.com/",
+    }, timeout=10)
     d = r.json().get("data")
     if not d:
         return {}
@@ -483,6 +549,58 @@ def stock_kline_yahoo(symbol: str, interval: str = "1d",
 # 港股 Yahoo K线: 直接调 stock_kline_yahoo("0700.HK")
 ```
 
+### 2.3 Tushare 日 K 替代源 — 美股 + 港股
+
+Tushare 可替代 Yahoo 日线数据，适合 Yahoo 429 或网络不可达时使用。注意 Tushare 港股接口有频率限制，避免短时间重复调用。
+
+```python
+def stock_kline_tushare(symbol: str, start_date: str = None,
+                         end_date: str = None, market: str = None) -> list[dict]:
+    """
+    Tushare Pro 日 K — 美股+港股
+    symbol: "AAPL" / "00700.HK" / "0700.HK"
+    start_date/end_date: YYYYMMDD，如 "20260501"
+    返回: [{date, open, high, low, close, volume, amount}, ...]
+    """
+    market, ts_code = _tushare_symbol(symbol, market)
+    api_name = "hk_daily" if market == "hk" else "us_daily"
+    fields = "ts_code,trade_date,open,high,low,close,vol,amount"
+    params = {"ts_code": ts_code}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    
+    rows = _tushare_rows(api_name, params=params, fields=fields)
+    result = []
+    for row in rows:
+        result.append({
+            "date": row.get("trade_date"),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("vol"),
+            "amount": row.get("amount"),
+            "source": "tushare",
+        })
+    return sorted(result, key=lambda x: x["date"])
+
+def stock_basic_tushare(symbol: str, market: str = None) -> dict:
+    """
+    Tushare 股票基础信息 — 美股+港股
+    返回: {ts_code, name, enname, market, list_date, source}
+    """
+    market, ts_code = _tushare_symbol(symbol, market)
+    api_name = "hk_basic" if market == "hk" else "us_basic"
+    fields = "ts_code,name,enname,market,exchange,list_date"
+    rows = _tushare_rows(api_name, params={"ts_code": ts_code}, fields=fields)
+    if not rows:
+        return {}
+    rows[0]["source"] = "tushare"
+    return rows[0]
+```
+
 ---
 
 ## Layer 3: 技术指标层
@@ -491,9 +609,9 @@ def stock_kline_yahoo(symbol: str, interval: str = "1d",
 
 **使用方式：** 先调 K 线函数获取数据，再传入技术指标函数：
 ```python
-klines = us_stock_kline_sina("AAPL", 120)
-macd = calc_macd(klines)
-rsi = calc_rsi(klines)
+# klines = us_stock_kline_sina("AAPL", 120)
+# macd = calc_macd(klines)
+# rsi = calc_rsi(klines)
 ```
 
 ### 3.1 移动平均线 MA / EMA
@@ -984,6 +1102,52 @@ def financial_statements_yahoo(symbol: str,
     }
 ```
 
+### 4.7 Tushare 财报与关键指标替代源 — 美股 + 港股
+
+Tushare 可替代 Yahoo quoteSummary 中的日线、三表、关键财务指标部分。Tushare 三表按科目行展开，和东财 datacenter 类似；关键指标为结构化字段。
+
+```python
+def financial_statements_tushare(symbol: str, statement: str = "income",
+                                  market: str = None) -> list[dict]:
+    """
+    Tushare 财报三表 — 美股+港股
+    symbol: "AAPL" / "00700.HK"
+    statement: "income" / "balance" / "cashflow"
+    返回: Tushare 原始科目行 [{ts_code, end_date, name, ind_name, ind_value, ...}]
+    """
+    market, ts_code = _tushare_symbol(symbol, market)
+    api_map = {
+        "us": {
+            "income": "us_income",
+            "balance": "us_balancesheet",
+            "cashflow": "us_cashflow",
+        },
+        "hk": {
+            "income": "hk_income",
+            "balance": "hk_balancesheet",
+            "cashflow": "hk_cashflow",
+        },
+    }
+    api_name = api_map[market][statement]
+    rows = _tushare_rows(api_name, params={"ts_code": ts_code})
+    for row in rows:
+        row["source"] = "tushare"
+    return rows
+
+def key_indicators_tushare(symbol: str, market: str = None) -> list[dict]:
+    """
+    Tushare 关键财务指标 — 美股+港股
+    symbol: "AAPL" / "00700.HK"
+    返回: 最近多期关键指标，字段随市场不同而不同
+    """
+    market, ts_code = _tushare_symbol(symbol, market)
+    api_name = "hk_fina_indicator" if market == "hk" else "us_fina_indicator"
+    rows = _tushare_rows(api_name, params={"ts_code": ts_code})
+    for row in rows:
+        row["source"] = "tushare"
+    return rows
+```
+
 ---
 
 ## Layer 5: 资金面层
@@ -1000,7 +1164,7 @@ def fund_flow_daily(ticker_or_code: str, secid_prefix: int = 105,
     港股: fund_flow_daily("00700", 116)
     返回: [{date, main_net, big_net, mid_net, small_net, main_pct, ...}, ...]
     """
-    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    url = "http://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
     params = {
         "secid": f"{secid_prefix}.{ticker_or_code}",
         "klt": 101,
@@ -1008,7 +1172,10 @@ def fund_flow_daily(ticker_or_code: str, secid_prefix: int = 105,
         "fields2": "f51,f52,f53,f54,f55,f56,f57",
         "lmt": limit,
     }
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, params=params, headers={
+        "User-Agent": UA,
+        "Referer": "https://quote.eastmoney.com/",
+    }, timeout=15)
     d = r.json()
     data = d.get("data")
     if not data or not data.get("klines"):
@@ -1018,6 +1185,8 @@ def fund_flow_daily(ticker_or_code: str, secid_prefix: int = 105,
     for line in data["klines"]:
         parts = line.split(",")
         # f51=日期, f52=主力净流入, f53=小单净流入, f54=中单净流入, f55=大单净流入, f56=超大单净流入
+        if len(parts) < 6:
+            continue
         result.append({
             "date": parts[0],
             "main_net": float(parts[1]),       # 主力净流入（元）
@@ -1245,7 +1414,7 @@ def stock_search(keyword: str, count: int = 10) -> list[dict]:
         "token": "D43BF722C8E33BDC906FB84D85E326E8",
         "count": count,
     }
-    r = requests.get(url, timeout=10)
+    r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=10)
     d = r.json()
     
     suggestions = d.get("QuotationCodeTable", {}).get("Data", [])
@@ -1355,7 +1524,7 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
     market_map = {"us_nasdaq": "m:105", "us_nyse": "m:106", "us_etf": "m:107", "hk": "m:116"}
     fs = market_map.get(market, market)
     
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    url = "https://push2delay.eastmoney.com/api/qt/clist/get"
     params = {
         "fs": fs,
         "fields": "f2,f3,f4,f5,f6,f7,f12,f14,f15,f16,f17,f18",
@@ -1364,12 +1533,17 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
         "fid": sort_field,
         "po": 1 if sort_desc else 0,
     }
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, params=params, headers={
+        "User-Agent": UA,
+        "Referer": "https://quote.eastmoney.com/",
+    }, timeout=15)
     d = r.json()
     data = d.get("data", {})
     
     total = data.get("total", 0)
     diff = data.get("diff", [])
+    if isinstance(diff, dict):
+        diff = list(diff.values())
     
     stocks = []
     for item in diff:
